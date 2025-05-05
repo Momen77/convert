@@ -7,12 +7,13 @@ import re # For normalization function
 
 # --- Streamlit App Configuration ---
 st.set_page_config(layout="wide")
-st.title("📊 Multi-CSV Column Structure Converter") # Updated title
+st.title("📊 Multi-CSV Column Structure Converter")
 st.write("""
 Upload **one or more 'Approval Details' CSV files** and **one 'Claim Details' CSV file (Template)**.
-The app will convert each Approval file to match the Claim file structure using predefined rules:
+The app converts each Approval file to match the Claim file structure using predefined rules.
 - **'TPA Ref.' column generated as 'YY/ApprovalID' (from Accident Date YY and Approval ID).**
 - 'Total Amount To Pay' column populated from 'Insurance Share Amount'.
+- **'Underwriting Year' will be filled (if missing) based on the earliest dates found in the Claim file.**
 Use the options below to include/exclude the 'Service Chapter' column and manage extra columns from the Approval file.
 The results from all processed Approval files will be combined into a single downloadable CSV.
 """)
@@ -63,231 +64,359 @@ AGGRESSIVE_PREDETERMINED_MAPPING = {
     'Deductible Amount': 'Deductible Amount',
     'Debit Amount': 'Debit Amount',
     'Total Amount To Pay': 'Insurance Share Amount', # User Rule
+    # 'Underwriting Year' is not mapped here, filled later
 }
 
+# --- Helper function to read CSV with encoding fallback ---
+def read_csv_with_encoding_fallback(uploaded_file, **kwargs):
+    """
+    Tries to read a CSV file with common encodings (UTF-8, latin-1, cp1252).
+    Resets the file pointer before each attempt.
+    Passes any additional kwargs (like nrows) to pd.read_csv.
+    """
+    encodings_to_try = ['utf-8', 'latin-1', 'cp1252', 'utf-8-sig'] # Common encodings
+    df = None
+    last_exception = None
+
+    read_kwargs = {'low_memory': False, **kwargs}
+
+    if uploaded_file is None:
+        raise ValueError("No file provided to read.")
+
+    file_name = getattr(uploaded_file, 'name', 'Unknown File')
+
+    for encoding in encodings_to_try:
+        try:
+            uploaded_file.seek(0)
+            df = pd.read_csv(uploaded_file, encoding=encoding, **read_kwargs)
+            return df
+        except UnicodeDecodeError as e:
+            last_exception = e
+        except Exception as e:
+            last_exception = e
+            break
+
+    if df is None:
+        error_msg = f"Error reading file '{file_name}'. Could not decode using common encodings {encodings_to_try} or another error occurred."
+        if last_exception:
+             error_msg += f" Last error: {last_exception}"
+        st.error(error_msg)
+        raise ValueError(f"Failed to read CSV '{file_name}'.")
 
 # --- File Uploaders ---
 col1, col2 = st.columns(2)
 
 with col1:
-    st.header("1. Upload Approval File(s)") # Updated header
-    # **** ALLOW MULTIPLE FILES ****
+    st.header("1. Upload Approval File(s)")
     approval_files = st.file_uploader(
         "Upload one or more 'Approval Details' CSV files",
         type=["csv"],
         key="approval_uploader",
-        accept_multiple_files=True # Key change here
+        accept_multiple_files=True
     )
 
 with col2:
     st.header("2. Upload Template File")
     claim_file = st.file_uploader(
-        "Upload ONE 'Claim Details - Service Level' CSV file", # Emphasize ONE
+        "Upload ONE 'Claim Details - Service Level' CSV file",
         type=["csv"],
         key="claim_uploader",
-        accept_multiple_files=False # Ensure only one template file
+        accept_multiple_files=False
     )
 
-# --- Main Logic ---
-# **** Check if list of approval_files is not empty ****
-if approval_files and claim_file is not None: # Check if approval_files list has content
-    try:
-        # Read the TEMPLATE file ONCE
-        claim_df = pd.read_csv(claim_file, low_memory=False)
-        st.success(f"Template file '{claim_file.name}' loaded successfully.")
+# --- Process Claim File Data for Underwriting Year Logic ---
+# Store results in session state to avoid recalculation if only other options change
+if claim_file is not None:
+    # Check if the file is new or hasn't been processed yet
+    if 'claim_file_name_processed' not in st.session_state or st.session_state['claim_file_name_processed'] != claim_file.name:
+        try:
+            claim_df_for_uw = read_csv_with_encoding_fallback(claim_file)
+            st.session_state['claim_df_for_uw'] = claim_df_for_uw # Store for later use
+            st.session_state['claim_file_name_processed'] = claim_file.name
+            st.success(f"Template file '{claim_file.name}' loaded successfully.")
 
-        st.divider() # Divider after file uploaders
+            # --- Calculate Earliest Dates per Underwriting Year ---
+            # *** CORRECTED COLUMN NAME ***
+            uw_year_col = 'Underwriting Year'
+            # *** ASSUMPTION: Using 'Accident Date' from Claim file to determine start ***
+            date_col_for_uw = 'Accident Date' # Change if needed
 
-        # --- Configuration Options (Set ONCE for all files) ---
-        st.header("3. Configuration Options")
-
-        include_service_chapter = st.checkbox(
-            "Include 'Service Chapter' column in output (if present in Claim file)",
-            value=True, # Default to including it
-            key="include_svc_chapter"
-        )
-
-        st.subheader("Options for Additional Columns")
-        st.write("""Select which columns from the **original Approval files** you want to include in the final output, in addition to the columns matching the Claim file structure.""")
-
-        # Determine extra columns config (applied to all files)
-        keep_extra_mode = st.radio(
-            "Choose how to handle extra columns from the Approval file:",
-            (
-                "Keep only columns matching Claim template structure",
-                "Keep ALL original Approval columns (append extras)",
-                "Keep SPECIFIC original Approval columns (select below)"
-            ),
-            index=0,
-            key="keep_extra_mode"
-        )
-        # Note: Selecting specific columns might be less useful if different files have different extra columns.
-        # We'll need the columns from the *first* approval file to populate the multiselect options.
-        # This assumes all approval files have a reasonably similar structure for the 'specific' option to work well.
-        specific_cols_to_keep = []
-        if keep_extra_mode == "Keep SPECIFIC original Approval columns (select below)":
-            # Read first approval file just to get column names for multiselect
-            try:
-                first_approval_df_cols = pd.read_csv(approval_files[0], low_memory=False, nrows=0).columns.tolist()
-                approval_cols_used_in_mapping = list(AGGRESSIVE_PREDETERMINED_MAPPING.values())
-                approval_cols_used_in_mapping_unique = list(set(approval_cols_used_in_mapping))
-                approval_cols_not_mapped = [
-                    col for col in first_approval_df_cols
-                    if col not in approval_cols_used_in_mapping_unique
-                ]
-                available_options = [col for col in approval_cols_not_mapped if col in first_approval_df_cols] # Redundant check, but safe
-                specific_cols_to_keep = st.multiselect(
-                    "Select specific Approval columns (based on first file) to keep:",
-                    options=available_options,
-                    key="specific_cols_select"
-                )
-            except Exception as e:
-                st.error(f"Could not read columns from the first approval file to populate specific column selection: {e}")
-                keep_extra_mode = "Keep only columns matching Claim template structure" # Fallback
-
-
-        st.divider()
-        st.header("4. Convert and Download")
-
-        # Button to trigger the conversion for ALL uploaded files
-        if st.button(f"🔄 Convert {len(approval_files)} Approval File(s)"):
-
-            all_converted_dfs = [] # List to store processed dataframes
-            files_processed_count = 0
-            files_failed_count = 0
-
-            # --- Determine Target Columns based on Checkbox (Done ONCE) ---
-            all_claim_columns = claim_df.columns.tolist()
-            if include_service_chapter:
-                target_columns = all_claim_columns
-            else:
-                target_columns = [col for col in all_claim_columns if col != 'Service Chapter']
-                if 'Service Chapter' in all_claim_columns:
-                     st.info("Note: 'Service Chapter' column explicitly excluded based on selection.")
-
-            # --- Loop through each uploaded approval file ---
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-
-            for i, current_approval_file in enumerate(approval_files):
-                status_text.text(f"Processing file {i+1}/{len(approval_files)}: {current_approval_file.name}...")
+            year_start_dates = {}
+            if uw_year_col in claim_df_for_uw.columns and date_col_for_uw in claim_df_for_uw.columns:
                 try:
-                    # Read the current approval file
-                    approval_df = pd.read_csv(current_approval_file, low_memory=False)
+                    temp_df = claim_df_for_uw[[uw_year_col, date_col_for_uw]].copy()
+                    temp_df.dropna(subset=[uw_year_col, date_col_for_uw], inplace=True)
+                    temp_df[date_col_for_uw] = pd.to_datetime(temp_df[date_col_for_uw], errors='coerce')
+                    temp_df.dropna(subset=[date_col_for_uw], inplace=True)
 
-                    # --- Core Conversion based on Template ---
-                    converted_df = pd.DataFrame()
-                    # Initialize all target columns to NA first
-                    for col in target_columns:
-                         converted_df[col] = pd.NA
-
-                    # Apply mappings from the dictionary
-                    for target_col in target_columns:
-                        if target_col == 'TPA Ref.': continue # Skip TPA Ref here
-
-                        if target_col in AGGRESSIVE_PREDETERMINED_MAPPING:
-                            source_col = AGGRESSIVE_PREDETERMINED_MAPPING[target_col]
-                            if source_col in approval_df.columns:
-                                converted_df[target_col] = approval_df[source_col].copy()
-                            # else: keep NA
-
-                    # --- Custom Logic for 'TPA Ref.' ---
-                    if 'TPA Ref.' in target_columns:
-                        if 'Accident Date' in approval_df.columns and 'Approval ID' in approval_df.columns:
-                            try:
-                                accident_dates = pd.to_datetime(approval_df['Accident Date'].astype(str), errors='coerce')
-                                approval_ids = approval_df['Approval ID']
-                                tpa_ref_series = pd.Series([pd.NA] * len(approval_df), index=approval_df.index).astype(object)
-                                valid_mask = accident_dates.notna() & approval_ids.notna()
-                                if valid_mask.any():
-                                    years = accident_dates[valid_mask].dt.strftime('%y')
-                                    ids_str = approval_ids[valid_mask].astype(str)
-                                    tpa_ref_series.loc[valid_mask] = years + '/' + ids_str
-                                converted_df['TPA Ref.'] = tpa_ref_series
-                            except Exception as e:
-                                st.warning(f"File '{current_approval_file.name}': Could not generate 'TPA Ref.' due to an error: {e}")
-                        else:
-                            st.warning(f"File '{current_approval_file.name}': Could not generate 'TPA Ref.' (missing 'Accident Date' or 'Approval ID').")
-
-
-                    # --- Handle Additional Columns ---
-                    added_original_cols = []
-                    approval_cols_original_current = approval_df.columns.tolist() # Use columns from *current* file
-                    approval_cols_used_in_mapping_unique = list(set(AGGRESSIVE_PREDETERMINED_MAPPING.values()))
-                    approval_cols_not_mapped_current = [
-                         col for col in approval_cols_original_current
-                         if col not in approval_cols_used_in_mapping_unique
-                    ]
-
-                    if keep_extra_mode == "Keep ALL original Approval columns (append extras)":
-                        for col in approval_cols_not_mapped_current:
-                             if col in approval_df.columns and col not in converted_df.columns:
-                               converted_df[col] = approval_df[col].copy()
-                               added_original_cols.append(col)
-
-                    elif keep_extra_mode == "Keep SPECIFIC original Approval columns (select below)":
-                        for col in specific_cols_to_keep: # Use selection based on first file
-                            if col in approval_df.columns and col not in converted_df.columns: # Check if col exists in *current* file
-                                converted_df[col] = approval_df[col].copy()
-                                added_original_cols.append(col)
-                    # else: only template structure kept
-
-                    # --- Final Column Ordering for this file ---
-                    final_target_order = target_columns
-                    desired_column_order = final_target_order + added_original_cols
-                    desired_column_order_unique = list(dict.fromkeys(desired_column_order))
-                    final_columns_present = [col for col in desired_column_order_unique if col in converted_df.columns]
-                    converted_df = converted_df[final_columns_present]
-
-                    # Append the processed dataframe to the list
-                    all_converted_dfs.append(converted_df)
-                    files_processed_count += 1
+                    if not temp_df.empty:
+                         min_dates_series = temp_df.groupby(uw_year_col)[date_col_for_uw].min()
+                         year_start_dates = min_dates_series.to_dict()
+                         st.session_state['year_start_dates'] = year_start_dates
+                         st.success(f"Calculated start dates for {len(year_start_dates)} Underwriting Year(s) from Claim file.")
+                    else:
+                         st.warning(f"No valid pairs of '{uw_year_col}' and '{date_col_for_uw}' found in Claim file.")
+                         st.session_state['year_start_dates'] = {}
 
                 except Exception as e:
-                    st.error(f"Failed to process file '{current_approval_file.name}': {e}")
-                    files_failed_count += 1
-
-                # Update progress bar
-                progress_bar.progress((i + 1) / len(approval_files))
-
-            status_text.text(f"Processing finished. {files_processed_count} file(s) processed successfully, {files_failed_count} file(s) failed.")
-
-            # --- Concatenate results and provide download ---
-            if all_converted_dfs:
-                # Use concat to combine all dataframes in the list
-                final_combined_df = pd.concat(all_converted_dfs, ignore_index=True)
-
-                st.subheader("✅ Combined Converted Data Preview (First 5 Rows)")
-                st.dataframe(final_combined_df.head())
-                st.info(f"Final combined output has {len(final_combined_df.columns)} columns and {len(final_combined_df)} rows.")
-                st.success("Conversion complete!")
-
-                # --- Download Button for Combined File ---
-                output = io.BytesIO()
-                final_combined_df.to_csv(output, index=False, encoding='utf-8')
-                output.seek(0)
-
-                st.download_button(
-                    label="💾 Download Combined CSV",
-                    data=output,
-                    file_name="combined_converted_approvals.csv", # New filename
-                    mime="text/csv",
-                )
+                    st.error(f"Error processing Claim file for Underwriting Year start dates: {e}")
+                    st.session_state['year_start_dates'] = {}
             else:
-                st.warning("No dataframes were successfully processed to combine.")
+                # Corrected column name in warning
+                st.warning(f"Cannot determine Underwriting Year start dates: Required columns ('{uw_year_col}', '{date_col_for_uw}') not found in Claim file.")
+                st.session_state['year_start_dates'] = {}
+
+        except Exception as e:
+            st.error(f"Failed to read or process Claim Template file '{claim_file.name}': {e}")
+            if 'claim_df_for_uw' in st.session_state: del st.session_state['claim_df_for_uw']
+            if 'year_start_dates' in st.session_state: del st.session_state['year_start_dates']
+            if 'claim_file_name_processed' in st.session_state: del st.session_state['claim_file_name_processed']
+            st.stop()
+
+# --- Configuration Options ---
+st.divider()
+st.header("3. Configuration Options")
+
+claim_df_loaded = 'claim_df_for_uw' in st.session_state and st.session_state['claim_df_for_uw'] is not None
+
+if claim_df_loaded:
+    claim_df_cols = st.session_state['claim_df_for_uw'].columns.tolist()
+
+    include_service_chapter = st.checkbox(
+        "Include 'Service Chapter' column in output (if present in Claim file)",
+        value=True,
+        key="include_svc_chapter"
+    )
+
+    st.subheader("Options for Additional Columns from Approval Files")
+    st.write("""Select which columns from the **original Approval files** you want to include in the final output, in addition to the columns matching the Claim file structure.""")
+    keep_extra_mode = st.radio(
+        "Choose how to handle extra columns from the Approval file:",
+        (
+            "Keep only columns matching Claim template structure",
+            "Keep ALL original Approval columns (append extras)",
+            "Keep SPECIFIC original Approval columns (select below)"
+        ),
+        index=0,
+        key="keep_extra_mode"
+    )
+
+    specific_cols_to_keep = []
+    if keep_extra_mode == "Keep SPECIFIC original Approval columns (select below)":
+        if approval_files:
+             try:
+                 first_approval_df_for_cols = read_csv_with_encoding_fallback(approval_files[0], nrows=0)
+                 first_approval_df_cols = first_approval_df_for_cols.columns.tolist()
+                 approval_cols_used_in_mapping = list(AGGRESSIVE_PREDETERMINED_MAPPING.values())
+                 approval_cols_used_in_mapping_unique = list(set(approval_cols_used_in_mapping))
+                 approval_cols_not_mapped = [
+                     col for col in first_approval_df_cols
+                     if col not in approval_cols_used_in_mapping_unique
+                 ]
+                 available_options = [col for col in approval_cols_not_mapped if col in first_approval_df_cols]
+                 specific_cols_to_keep = st.multiselect(
+                     "Select specific Approval columns (based on first file) to keep:",
+                     options=available_options,
+                     key="specific_cols_select"
+                 )
+             except Exception as e:
+                 st.warning(f"Could not read columns from the first approval file: {e}. Specific selection may fail.")
+        else:
+            st.warning("Upload an Approval file to select specific columns.")
+else:
+    st.info("Upload the Claim Template file to see configuration options.")
 
 
-    except FileNotFoundError:
-         st.error("Error: The Template (Claim Details) file could not be read. Please ensure it's a valid CSV.")
-    except KeyError as e:
-         st.error(f"Error: A column specified in the mapping ('{e}') was not found in the expected source file. Please check the uploaded files.")
-    except Exception as e:
-         st.error(f"An unexpected error occurred during setup or processing: {e}")
-         st.error("Please ensure the uploaded files are valid CSVs and try again.")
+# --- Processing Logic ---
+st.divider()
+st.header("4. Convert and Download")
 
-elif not approval_files and claim_file is not None:
-     st.info("Please upload at least one Approval file.")
-elif approval_files and claim_file is None:
-     st.info("Please upload the Claim (Template) file.")
-else: # Neither uploaded
-     st.info("Please upload Approval file(s) and the Claim (Template) file to begin.")
+if approval_files and claim_df_loaded:
+    if st.button(f"🔄 Process {len(approval_files)} Approval File(s)"):
+
+        all_converted_dfs = []
+        files_processed_count = 0
+        files_failed_count = 0
+
+        # --- Determine Target Columns ---
+        claim_df = st.session_state['claim_df_for_uw']
+        all_claim_columns = claim_df.columns.tolist()
+        target_uw_col = 'Underwriting Year' # Corrected Name
+
+        if include_service_chapter:
+            target_columns = all_claim_columns
+        else:
+            target_columns = [col for col in all_claim_columns if col != 'Service Chapter']
+
+        # Ensure Underwriting Year is targeted if present in template
+        if target_uw_col not in target_columns and target_uw_col in all_claim_columns:
+             target_columns.append(target_uw_col)
+
+        # --- Loop through each uploaded approval file ---
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        for i, current_approval_file in enumerate(approval_files):
+            file_name_for_msg = current_approval_file.name
+            status_text.text(f"Processing file {i+1}/{len(approval_files)}: {file_name_for_msg}...")
+            try:
+                approval_df = read_csv_with_encoding_fallback(current_approval_file)
+                converted_df = pd.DataFrame()
+                for col in target_columns:
+                    converted_df[col] = pd.NA
+
+                # Apply mappings
+                for target_col in target_columns:
+                    if target_col in ['TPA Ref.', target_uw_col]: continue # Skip TPA Ref and UW Year here
+
+                    if target_col in AGGRESSIVE_PREDETERMINED_MAPPING:
+                        source_col = AGGRESSIVE_PREDETERMINED_MAPPING[target_col]
+                        if source_col in approval_df.columns:
+                            converted_df[target_col] = approval_df[source_col].copy()
+
+                # Custom Logic for 'TPA Ref.'
+                if 'TPA Ref.' in target_columns:
+                    if 'Accident Date' in approval_df.columns and 'Approval ID' in approval_df.columns:
+                        try:
+                            approval_ids_str = approval_df['Approval ID'].astype(str)
+                            accident_dates = pd.to_datetime(approval_df['Accident Date'], errors='coerce')
+                            tpa_ref_series = pd.Series([pd.NA] * len(approval_df), index=approval_df.index).astype(object)
+                            valid_mask = accident_dates.notna() & approval_ids_str.notna() & (approval_ids_str != '')
+                            if valid_mask.any():
+                                years = accident_dates[valid_mask].dt.strftime('%y')
+                                ids_str_valid = approval_ids_str[valid_mask]
+                                tpa_ref_series.loc[valid_mask] = years + '/' + ids_str_valid
+                            converted_df['TPA Ref.'] = tpa_ref_series
+                        except Exception as e:
+                            st.warning(f"File '{file_name_for_msg}': Could not generate 'TPA Ref.': {e}")
+                    else:
+                        st.warning(f"File '{file_name_for_msg}': 'TPA Ref.' needs 'Accident Date' & 'Approval ID'.")
+
+                # Handle Additional Columns
+                added_original_cols = []
+                if keep_extra_mode != "Keep only columns matching Claim template structure":
+                    approval_cols_original_current = approval_df.columns.tolist()
+                    approval_cols_used_in_mapping_values = list(AGGRESSIVE_PREDETERMINED_MAPPING.values())
+                    approval_cols_used_in_mapping_unique = list(set(approval_cols_used_in_mapping_values))
+                    cols_to_potentially_add = []
+                    if keep_extra_mode == "Keep ALL original Approval columns (append extras)":
+                         cols_to_potentially_add = [
+                             col for col in approval_cols_original_current
+                             if col not in approval_cols_used_in_mapping_unique
+                         ]
+                    elif keep_extra_mode == "Keep SPECIFIC original Approval columns (select below)":
+                         selected_specifics = st.session_state.get('specific_cols_select', [])
+                         cols_to_potentially_add = [
+                             col for col in selected_specifics
+                             if col in approval_cols_original_current
+                         ]
+                    for col in cols_to_potentially_add:
+                         if col not in converted_df.columns:
+                             converted_df[col] = approval_df[col].copy()
+                             added_original_cols.append(col)
+
+                # Final Column Ordering
+                final_target_order_for_file = [col for col in target_columns if col in converted_df.columns]
+                desired_column_order = final_target_order_for_file + added_original_cols
+                seen = set()
+                desired_column_order_unique = [x for x in desired_column_order if not (x in seen or seen.add(x))]
+                final_columns_present = [col for col in desired_column_order_unique if col in converted_df.columns]
+                converted_df = converted_df[final_columns_present]
+
+                all_converted_dfs.append(converted_df)
+                files_processed_count += 1
+
+            except ValueError as e:
+                 st.error(f"Skipping file '{file_name_for_msg}' due to read error: {e}")
+                 files_failed_count += 1
+            except KeyError as e:
+                 st.error(f"Skipping file '{file_name_for_msg}': Processing error - column '{e}'.")
+                 files_failed_count += 1
+            except Exception as e:
+                st.error(f"Failed to process file '{file_name_for_msg}': {e}")
+                files_failed_count += 1
+
+            progress_bar.progress((i + 1) / len(approval_files))
+
+        status_text.text(f"Processing finished. {files_processed_count} file(s) processed, {files_failed_count} failed.")
+
+        # --- Concatenate and Fill Underwriting Year ---
+        if all_converted_dfs:
+            final_combined_df = pd.concat(all_converted_dfs, ignore_index=True, join='outer')
+            st.success(f"Successfully combined data from {files_processed_count} file(s).")
+
+            # --- Fill Underwriting Year ---
+            year_start_dates_dict = st.session_state.get('year_start_dates', {})
+            uw_year_filled = False
+            # *** Assumption: Using 'Accident Date' from combined file to determine UW Year ***
+            date_col_for_filling = 'Accident Date' # Change if needed
+            # *** CORRECTED COLUMN NAME ***
+            target_uw_col = 'Underwriting Year'
+
+            if not year_start_dates_dict:
+                st.warning("Skipping 'Underwriting Year' fill: No start dates calculated.")
+            # Use corrected name in checks
+            elif target_uw_col not in final_combined_df.columns:
+                 st.warning(f"Skipping 'Underwriting Year' fill: Column '{target_uw_col}' not found.")
+            elif date_col_for_filling not in final_combined_df.columns:
+                 st.warning(f"Skipping 'Underwriting Year' fill: Date column '{date_col_for_filling}' not found.")
+            else:
+                 try:
+                     st.info("Attempting to fill missing 'Underwriting Year'...")
+                     final_combined_df[date_col_for_filling] = pd.to_datetime(final_combined_df[date_col_for_filling], errors='coerce')
+                     sorted_starts = sorted(year_start_dates_dict.items(), key=lambda item: item[1])
+
+                     def get_underwriting_year(approval_date, year_start_dates_sorted):
+                         if pd.isna(approval_date): return pd.NA
+                         applicable_year = pd.NA
+                         for year, start_date in year_start_dates_sorted:
+                             if approval_date >= start_date:
+                                 applicable_year = year
+                             else: break
+                         return applicable_year
+
+                     valid_date_mask = final_combined_df[date_col_for_filling].notna()
+                     if valid_date_mask.any():
+                         calculated_uw_years = final_combined_df.loc[valid_date_mask, date_col_for_filling].apply(
+                             lambda date: get_underwriting_year(date, sorted_starts)
+                         )
+                         # Use corrected name for filling
+                         initial_nas = final_combined_df[target_uw_col].isna().sum()
+                         final_combined_df[target_uw_col].fillna(calculated_uw_years, inplace=True)
+                         final_nas = final_combined_df[target_uw_col].isna().sum()
+                         filled_count = initial_nas - final_nas
+                         if filled_count > 0:
+                              st.success(f"Filled {filled_count} missing 'Underwriting Year' values.")
+                              uw_year_filled = True
+                         else: st.info("No missing 'Underwriting Year' values needed filling.")
+                     else: st.info(f"No valid dates in '{date_col_for_filling}' for 'Underwriting Year'.")
+                 except Exception as fill_e:
+                      st.error(f"Error filling 'Underwriting Year': {fill_e}")
+
+            # --- Display Final Preview and Download ---
+            st.markdown("---")
+            st.subheader("✅ Combined Data Preview (First 5 Rows)")
+            st.dataframe(final_combined_df.head())
+            st.info(f"Final output: {len(final_combined_df.columns)} columns, {len(final_combined_df)} rows.")
+
+            output = io.BytesIO()
+            final_combined_df.to_csv(output, index=False, encoding='utf-8-sig')
+            output.seek(0)
+
+            st.download_button(
+                label="💾 Download Combined CSV",
+                data=output,
+                file_name="combined_converted_approvals_with_uw_year.csv",
+                mime="text/csv",
+            )
+        elif files_processed_count == 0 and files_failed_count > 0:
+             st.error("Processing failed for all uploaded Approval files.")
+        else:
+            st.warning("No dataframes were successfully processed or combined.")
+
+elif not approval_files and claim_df_loaded:
+     st.info("Upload at least one Approval file to enable processing.")
+elif not claim_df_loaded:
+     st.info("Upload the Claim Template file first.")
+else:
+     st.info("Upload Approval file(s) and the Claim Template file to begin.")
