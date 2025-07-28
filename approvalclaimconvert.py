@@ -353,41 +353,36 @@ if approval_files and claim_df_loaded:
                     except Exception as e:
                         st.warning(f"File '{file_name_for_msg}': Claims enhancement failed: {e}")
 
-                # Custom Logic for 'TPA Ref.' - only if not enhanced with claims data
+                # Custom Logic for 'TPA Ref.' - generate fallback values for rows without TPA Ref
                 if 'TPA Ref.' in target_columns:
-                    # Check if claims enhancement was applied and TPA Ref already populated
-                    claims_enhanced = enhance_with_claims_enabled and claims_data is not None
-                    tpa_ref_already_populated = False
-                    
-                    if claims_enhanced and 'TPA Ref.' in converted_df.columns:
-                        # Check if any TPA Ref values were populated from claims
-                        tpa_ref_already_populated = converted_df['TPA Ref.'].notna().any()
-                    
-                    # Only generate TPA Ref if not already populated from claims
-                    if not tpa_ref_already_populated:
-                        if 'Accident Date' in approval_df.columns and 'Approval ID' in approval_df.columns:
-                            try:
-                                approval_ids_str = approval_df['Approval ID'].astype(str)
-                                accident_dates = pd.to_datetime(approval_df['Accident Date'], errors='coerce')
-                                tpa_ref_series = pd.Series([pd.NA] * len(approval_df), index=approval_df.index).astype(object)
-                                valid_mask = accident_dates.notna() & approval_ids_str.notna() & (approval_ids_str != '')
-                                if valid_mask.any():
-                                    years = accident_dates[valid_mask].dt.strftime('%y')
-                                    ids_str_valid = approval_ids_str[valid_mask]
-                                    tpa_ref_series.loc[valid_mask] = years + '/' + ids_str_valid
+                    if 'Accident Date' in approval_df.columns and 'Approval ID' in approval_df.columns:
+                        try:
+                            approval_ids_str = approval_df['Approval ID'].astype(str)
+                            accident_dates = pd.to_datetime(approval_df['Accident Date'], errors='coerce')
+                            tpa_ref_series = pd.Series([pd.NA] * len(approval_df), index=approval_df.index).astype(object)
+                            valid_mask = accident_dates.notna() & approval_ids_str.notna() & (approval_ids_str != '')
+                            if valid_mask.any():
+                                years = accident_dates[valid_mask].dt.strftime('%y')
+                                ids_str_valid = approval_ids_str[valid_mask]
+                                tpa_ref_series.loc[valid_mask] = years + '/' + ids_str_valid
+                            
+                            # Only update rows where TPA Ref is still null/empty
+                            if 'TPA Ref.' in converted_df.columns:
+                                null_mask = converted_df['TPA Ref.'].isna() | (converted_df['TPA Ref.'] == '')
+                                converted_df.loc[null_mask, 'TPA Ref.'] = tpa_ref_series.loc[null_mask]
+                            else:
+                                converted_df['TPA Ref.'] = tpa_ref_series
                                 
-                                # Only update rows where TPA Ref is still null/empty
-                                if 'TPA Ref.' in converted_df.columns:
-                                    null_mask = converted_df['TPA Ref.'].isna() | (converted_df['TPA Ref.'] == '')
-                                    converted_df.loc[null_mask, 'TPA Ref.'] = tpa_ref_series.loc[null_mask]
-                                else:
-                                    converted_df['TPA Ref.'] = tpa_ref_series
-                            except Exception as e:
-                                st.warning(f"File '{file_name_for_msg}': Could not generate 'TPA Ref.': {e}")
-                        else:
-                            st.warning(f"File '{file_name_for_msg}': 'TPA Ref.' needs 'Accident Date' & 'Approval ID'.")
+                            # Count how many were filled from claims vs generated
+                            claims_enhanced = enhance_with_claims_enabled and claims_data is not None
+                            if claims_enhanced:
+                                claims_filled = converted_df['TPA Ref.'].notna().sum() - tpa_ref_series.notna().sum()
+                                fallback_filled = tpa_ref_series.notna().sum()
+                                st.info(f"File '{file_name_for_msg}': TPA Ref. - {claims_filled} from claims, {fallback_filled} generated as fallback.")
+                        except Exception as e:
+                            st.warning(f"File '{file_name_for_msg}': Could not generate 'TPA Ref.': {e}")
                     else:
-                        st.info(f"File '{file_name_for_msg}': TPA Ref. values preserved from claims data.")
+                        st.warning(f"File '{file_name_for_msg}': 'TPA Ref.' needs 'Accident Date' & 'Approval ID'.")
 
                 # Handle Additional Columns
                 added_original_cols = []
