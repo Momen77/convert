@@ -322,8 +322,11 @@ if approval_files and claim_df_loaded:
                                     # Merge claims data, prioritizing non-null values from claims
                                     for col, claims_value in claims_row.items():
                                         if col != '_composite_key' and pd.notna(claims_value):
+                                            # Special handling for TPA Ref - always use claims value if available
+                                            if col == 'TPA Ref.' and pd.notna(claims_value):
+                                                enhanced_row[col] = claims_value
                                             # If the column exists in our target and is null/empty, fill it
-                                            if col in enhanced_row and (pd.isna(enhanced_row[col]) or enhanced_row[col] == ''):
+                                            elif col in enhanced_row and (pd.isna(enhanced_row[col]) or enhanced_row[col] == ''):
                                                 enhanced_row[col] = claims_value
                                             # If it's a new column not in target, add it if we're keeping extra columns
                                             elif col not in enhanced_row and col in claims_data.columns:
