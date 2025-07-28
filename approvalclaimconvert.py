@@ -124,7 +124,7 @@ with col2:
         accept_multiple_files=False
     )
 
-# --- Process Claim File Data for Underwriting Year Logic ---
+# --- Process Claim File Data for Underwriting Year Logic and Claims Enhancement ---
 # Store results in session state to avoid recalculation if only other options change
 if claim_file is not None:
     # Check if the file is new or hasn't been processed yet
@@ -134,6 +134,16 @@ if claim_file is not None:
             st.session_state['claim_df_for_uw'] = claim_df_for_uw # Store for later use
             st.session_state['claim_file_name_processed'] = claim_file.name
             st.success(f"Template file '{claim_file.name}' loaded successfully.")
+            
+            # Create claims enhancement index for matching
+            if 'Approval ID' in claim_df_for_uw.columns and 'Service Code' in claim_df_for_uw.columns:
+                # Create composite key for claims data
+                claim_df_for_uw['_composite_key'] = claim_df_for_uw['Approval ID'].astype(str) + '_' + claim_df_for_uw['Service Code'].astype(str)
+                st.session_state['claims_enhancement_data'] = claim_df_for_uw
+                st.success(f"Claims enhancement index created with {len(claim_df_for_uw)} records.")
+            else:
+                st.warning("Claims enhancement disabled: 'Approval ID' or 'Service Code' columns not found in claims file.")
+                st.session_state['claims_enhancement_data'] = None
 
             # --- Calculate Earliest Dates per Underwriting Year ---
             # *** CORRECTED COLUMN NAME ***
@@ -186,6 +196,13 @@ if claim_df_loaded:
         "Include 'Service Chapter' column in output (if present in Claim file)",
         value=True,
         key="include_svc_chapter"
+    )
+    
+    enhance_with_claims = st.checkbox(
+        "Enhance output with claims data (merge matching Approval ID + Service Code)",
+        value=True,
+        key="enhance_claims",
+        help="When enabled, rows with matching Approval ID and Service Code will include all available data from the claims file"
     )
 
     st.subheader("Options for Additional Columns from Approval Files")
@@ -273,6 +290,65 @@ if approval_files and claim_df_loaded:
                         source_col = AGGRESSIVE_PREDETERMINED_MAPPING[target_col]
                         if source_col in approval_df.columns:
                             converted_df[target_col] = approval_df[source_col].copy()
+                            
+                # Enhanced Claims Data Integration
+                enhance_with_claims_enabled = st.session_state.get('enhance_claims', True)
+                claims_data = st.session_state.get('claims_enhancement_data', None)
+                
+                if enhance_with_claims_enabled and claims_data is not None:
+                    try:
+                        # Create composite key for approval data
+                        if 'Approval ID' in approval_df.columns and 'Detail Service Code' in approval_df.columns:
+                            approval_df['_composite_key'] = approval_df['Approval ID'].astype(str) + '_' + approval_df['Detail Service Code'].astype(str)
+                            
+                            # Create a mapping dictionary from claims data
+                            claims_dict = {}
+                            for idx, row in claims_data.iterrows():
+                                key = row['_composite_key']
+                                claims_dict[key] = row.to_dict()
+                            
+                            # Enhance converted_df with claims data
+                            enhanced_rows = []
+                            for idx, approval_row in approval_df.iterrows():
+                                composite_key = approval_row['_composite_key']
+                                
+                                # Start with the converted row
+                                enhanced_row = converted_df.iloc[idx].to_dict()
+                                
+                                # If we have matching claims data, merge it
+                                if composite_key in claims_dict:
+                                    claims_row = claims_dict[composite_key]
+                                    
+                                    # Merge claims data, prioritizing non-null values from claims
+                                    for col, claims_value in claims_row.items():
+                                        if col != '_composite_key' and pd.notna(claims_value):
+                                            # If the column exists in our target and is null/empty, fill it
+                                            if col in enhanced_row and (pd.isna(enhanced_row[col]) or enhanced_row[col] == ''):
+                                                enhanced_row[col] = claims_value
+                                            # If it's a new column not in target, add it if we're keeping extra columns
+                                            elif col not in enhanced_row and col in claims_data.columns:
+                                                enhanced_row[col] = claims_value
+                                
+                                enhanced_rows.append(enhanced_row)
+                            
+                            # Rebuild converted_df with enhanced data
+                            if enhanced_rows:
+                                enhanced_df = pd.DataFrame(enhanced_rows)
+                                # Ensure we maintain the original column order plus any new ones
+                                original_cols = [col for col in converted_df.columns if col in enhanced_df.columns]
+                                new_cols = [col for col in enhanced_df.columns if col not in original_cols]
+                                final_col_order = original_cols + new_cols
+                                converted_df = enhanced_df[final_col_order]
+                                
+                            # Clean up temporary column
+                            if '_composite_key' in approval_df.columns:
+                                approval_df.drop('_composite_key', axis=1, inplace=True)
+                                
+                            st.info(f"File '{file_name_for_msg}': Enhanced with claims data using Approval ID + Service Code matching.")
+                        else:
+                            st.warning(f"File '{file_name_for_msg}': Claims enhancement skipped - missing required columns.")
+                    except Exception as e:
+                        st.warning(f"File '{file_name_for_msg}': Claims enhancement failed: {e}")
 
                 # Custom Logic for 'TPA Ref.'
                 if 'TPA Ref.' in target_columns:
